@@ -19,7 +19,7 @@ jobs:
         run: |
           uv venv --clear .venv --python 3.13
           uv pip install -p .venv torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          uv pip install -p .venv -e ".[dev,ai]" pip-audit
+          uv pip install -p .venv -e ".[dev,ai]" pip-audit "setuptools>=78.1.1"
           uv pip install -p .venv --no-deps easyocr
       - name: Audit installed environment
         run: .venv/bin/python -m pip_audit --skip-editable
