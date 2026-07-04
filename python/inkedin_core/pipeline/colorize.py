@@ -90,4 +90,9 @@ def build_colorizer(mode: str, device_pref: str = "auto") -> tuple[Colorizer, st
         from ..models.gan import V2GanColorizer
 
         return V2GanColorizer(device_pref=device_pref), theme_overlay
+    if base == "ai" or base.startswith("ai:"):
+        from ..models.diffusion import DiffusionColorizer
+
+        prompt = base[3:] if base.startswith("ai:") else ""
+        return DiffusionColorizer(device_pref=device_pref, prompt=prompt), theme_overlay
     raise ValueError(f"unknown mode: {mode!r}")

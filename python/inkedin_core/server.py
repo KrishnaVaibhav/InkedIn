@@ -236,6 +236,7 @@ button.alt{background:#2c2c38}button:disabled{opacity:.4;cursor:default}
 <div class="card" id="ctl" style="display:none">
   <div class="row">
     <div><label>Mode</label><select id="mode"></select></div>
+    <div><label>Prompt (ai mode: describe colors, e.g. "red jacket, blonde hair")</label><input type="text" id="prompt" placeholder="optional"></div>
     <div><label>Line strength (ink)</label><input type="text" id="ink" value="0.85"></div>
     <div><label>Device</label><select id="dev"><option>auto</option><option>cuda</option><option>cpu</option></select></div>
   </div>
@@ -263,7 +264,7 @@ const log=m=>$('log').textContent=m;
 async function api(p,opt){const r=await fetch(p,opt);if(!r.ok){throw new Error((await r.json()).detail||r.status)}return r.json()}
 
 (async()=>{try{const m=await api('/api/meta',{headers:H});
-  const modes=['fast',...m.themes.map(t=>'theme:'+t),...m.themes.map(t=>'fast+theme:'+t)];
+  const modes=['ai','fast',...m.themes.map(t=>'theme:'+t),...m.themes.map(t=>'fast+theme:'+t)];
   $('mode').innerHTML=modes.map(x=>`<option>${x}</option>`).join('');
   log(`device: ${m.device.device} (${m.device.name})`);}catch(e){log('meta failed: '+e.message)}})();
 
@@ -294,7 +295,8 @@ $('none').onclick=()=>{SEL.clear();document.querySelectorAll('.pg').forEach(d=>d
 
 $('run').onclick=async()=>{if(!JOB)return;
   try{await api(`/api/jobs/${JOB}/run`,{method:'POST',headers:H,body:JSON.stringify(
-    {pages:[...SEL],mode:$('mode').value,device:$('dev').value,ink_weight:parseFloat($('ink').value)||0.85})});
+    {pages:[...SEL],mode:($('mode').value==='ai'&&$('prompt').value.trim())?('ai:'+$('prompt').value.trim()):$('mode').value,
+     device:$('dev').value,ink_weight:parseFloat($('ink').value)||0.85})});
   log('running…');POLL=setInterval(refresh,1200)}catch(e){log('run failed: '+e.message)}};
 
 $('cancel').onclick=()=>JOB&&api(`/api/jobs/${JOB}/cancel`,{method:'POST',headers:H});
