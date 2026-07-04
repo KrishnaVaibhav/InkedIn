@@ -1,5 +1,5 @@
 # InkedIn
-
+[![CI](https://github.com/KrishnaVaibhav/InkedIn/actions/workflows/ci.yml/badge.svg)](https://github.com/KrishnaVaibhav/InkedIn/actions/workflows/ci.yml)
 Local manga/comic colorizer. Everything runs on this machine — no cloud, no telemetry, no open ports beyond a token-guarded localhost UI.
 
 ## Quick start
