@@ -13,7 +13,10 @@ class DeviceInfo:
 
 
 def probe(preference: str = "auto") -> DeviceInfo:
-    import torch
+    try:
+        import torch
+    except ImportError:  # torch-less install (theme modes / packaged exe)
+        return DeviceInfo("cpu", "CPU (torch not installed)")
 
     pref = preference.lower()
     if pref in ("auto", "cuda") and torch.cuda.is_available():

@@ -1,12 +1,27 @@
+# --- local-only: never publish ------------------------------------------
+# environments & caches
 .venv/
 .uv-cache/
 __pycache__/
 *.pyc
 .pytest_cache/
+*.egg-info/
+# model weights & runtime caches (downloaded on demand, license-gated)
 models/weights/
 models/hf/
+models/easyocr/
+# user data: imported books, jobs, exports, job database
 data/
+# build outputs
 dist/
+build/_work/
+build/*.spec
 node_modules/
 target/
 *.log
+# editors / OS / agents
+.vscode/
+.idea/
+.claude/
+Thumbs.db
+.DS_Store

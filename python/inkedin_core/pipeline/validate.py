@@ -20,7 +20,8 @@ Image.MAX_IMAGE_PIXELS = MAX_IMAGE_MEGAPIXELS * 1_000_000
 
 
 def sniff_type(path: Path) -> str:
-    """Return detected type from magic bytes: png/jpeg/webp/bmp/tiff/gif/pdf/zip."""
+    """Return detected type from magic bytes:
+    png/jpeg/webp/bmp/tiff/gif/pdf/zip/7z/rar/tar."""
     size = path.stat().st_size
     if size == 0:
         raise ValidationFailed(f"empty file: {path.name}")
@@ -29,12 +30,17 @@ def sniff_type(path: Path) -> str:
 
     with open(path, "rb") as f:
         head = f.read(16)
+        # tar (CBT): "ustar" signature sits at offset 257, not 0.
+        f.seek(257)
+        tar_sig = f.read(8)
 
     for magic, kind in MAGIC.items():
         if head.startswith(magic):
             if kind == "webp" and head[8:12] != b"WEBP":
                 continue
             return kind
+    if tar_sig[:5] == b"ustar":
+        return "tar"
     raise ValidationFailed(f"unrecognized file signature: {path.name}")
 
 

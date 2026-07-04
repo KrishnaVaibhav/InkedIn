@@ -41,6 +41,14 @@ def _db() -> sqlite3.Connection:
     ensure_dirs()
     conn = sqlite3.connect(db_path(), check_same_thread=False)
     conn.executescript(_SCHEMA)
+    for ddl in (  # additive migrations for pre-existing databases
+        "ALTER TABLE pages ADD COLUMN is_color INTEGER DEFAULT 0",
+        "ALTER TABLE pages ADD COLUMN color_score REAL DEFAULT 0",
+    ):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass  # column already exists
     return conn
 
 
@@ -60,32 +68,47 @@ class JobManager:
 
     # -- lifecycle ---------------------------------------------------------
 
-    def create(self, input_path: Path) -> Job:
+    def create(
+        self,
+        input_path: Path,
+        split_spreads: bool = False,
+        rtl: bool = False,
+        display_name: str | None = None,
+    ) -> Job:
         job_id = uuid.uuid4().hex[:12]
         jdir = jobs_dir() / job_id
         jdir.mkdir(parents=True)
-        pages = ingest.ingest(input_path, jdir)
+        pages = ingest.ingest(input_path, jdir, split_spreads=split_spreads, rtl=rtl)
+        color_flags = self._make_thumbs(jdir, pages)
         with self.lock:
             self.conn.execute(
                 "INSERT INTO jobs (id, created_at, status, input, mode, device, selected, export_fmt) "
                 "VALUES (?,?,?,?,?,?,?,?)",
-                (job_id, time.time(), "ready", str(input_path), "", "", "[]", ""),
+                (job_id, time.time(), "ready", display_name or str(input_path), "", "", "[]", ""),
             )
             self.conn.executemany(
-                "INSERT INTO pages (job_id, page, status) VALUES (?,?,?)",
-                [(job_id, p.index, "pending") for p in pages],
+                "INSERT INTO pages (job_id, page, status, is_color, color_score) VALUES (?,?,?,?,?)",
+                [
+                    (job_id, p.index, "pending", int(color_flags[p.index][0]), color_flags[p.index][1])
+                    for p in pages
+                ],
             )
             self.conn.commit()
-        self._make_thumbs(jdir, pages)
         return Job(job_id, jdir, pages)
 
-    def _make_thumbs(self, jdir: Path, pages: list[ingest.PageRef]) -> None:
+    def _make_thumbs(self, jdir: Path, pages: list[ingest.PageRef]) -> dict[int, tuple[bool, float]]:
+        """Thumbnail pass; the decode is reused to detect already-colored pages."""
+        from .pipeline import colorstats
+
         tdir = jdir / "thumbs"
         tdir.mkdir(exist_ok=True)
+        flags: dict[int, tuple[bool, float]] = {}
         for p in pages:
             with Image.open(p.source_path) as im:
+                flags[p.index] = colorstats.is_color_page(np.array(im.convert("RGB")))
                 im.thumbnail((THUMB_LONG_EDGE, THUMB_LONG_EDGE))
                 im.save(tdir / f"t_{p.index:05d}.jpg", quality=80)
+        return flags
 
     def job_dir(self, job_id: str) -> Path:
         d = jobs_dir() / job_id
@@ -93,11 +116,39 @@ class JobManager:
             raise KeyError(f"unknown job {job_id}")
         return d
 
+    def list_jobs(self) -> list[dict]:
+        cur = self.conn.execute(
+            "SELECT j.id, j.created_at, j.status, j.input, COUNT(p.page) "
+            "FROM jobs j LEFT JOIN pages p ON p.job_id = j.id "
+            "GROUP BY j.id ORDER BY j.created_at DESC"
+        )
+        out = []
+        for jid, created, status, inp, n in cur.fetchall():
+            if not (jobs_dir() / jid).is_dir():
+                continue  # row without workspace (cleaned externally)
+            name = Path(inp).name if inp else jid
+            parent = str(Path(inp).parent) if inp and Path(inp).is_absolute() else ""
+            out.append(
+                {"job": jid, "created": created, "status": status, "name": name,
+                 "pages": n, "dir": parent}
+            )
+        return out
+
     def list_pages(self, job_id: str) -> list[dict]:
         cur = self.conn.execute(
-            "SELECT page, status, out_path, error FROM pages WHERE job_id=? ORDER BY page", (job_id,)
+            "SELECT page, status, out_path, error, is_color FROM pages WHERE job_id=? ORDER BY page",
+            (job_id,),
         )
-        return [{"page": r[0], "status": r[1], "out": r[2], "error": r[3]} for r in cur.fetchall()]
+        return [
+            {"page": r[0], "status": r[1], "out": r[2], "error": r[3], "is_color": bool(r[4])}
+            for r in cur.fetchall()
+        ]
+
+    def color_pages(self, job_id: str) -> list[int]:
+        cur = self.conn.execute(
+            "SELECT page FROM pages WHERE job_id=? AND is_color=1 ORDER BY page", (job_id,)
+        )
+        return [r[0] for r in cur.fetchall()]
 
     def cancel(self, job_id: str) -> None:
         if job_id in self.cancel_flags:
@@ -134,17 +185,53 @@ class JobManager:
         device: str = "auto",
         ink_weight: float = 0.85,
         anchor_page: int | None = None,
+        ref_image: Path | None = None,
+        ml_text: bool = False,
+        translate: bool = False,
+        translate_sfx: bool = False,
+        translate_lang: str = "ja",
+        auto_ref: bool = True,
+        ref_strength: float = 0.15,  # auto color-page bias (0 = off)
+        ip_scale: float = 0.65,  # ai: user reference IP-Adapter strength
+        self_ref_scale: float = 0.4,  # ai: panels follow panel 1
+        steps: int = 24,  # ai: diffusion steps
+        fill_voids: bool = True,  # inpaint enclosed gray "missing spots"
+        protect_text: bool = True,  # keep bubbles/lettering neutral
     ) -> dict:
-        """Colorize selected pages (all if None). Blocking; call from a worker thread."""
+        """Colorize and/or translate selected pages (all if None). Blocking;
+        call from a worker thread. mode 'none' + translate = translation only."""
+        if mode == "none" and not translate:
+            raise ValueError("mode 'none' does nothing unless translate is enabled")
+        if ml_text or translate:  # detector needed: fetch RT-DETR weights
+            from .models import bubbles
+
+            bubbles.ensure_downloaded()
         jdir = self.job_dir(job_id)
         pages_dir = jdir / "pages"
         out_dir = jdir / "colored"
         out_dir.mkdir(exist_ok=True)
 
         all_pages = sorted(int(p.stem.split("_")[1]) for p in pages_dir.glob("page_*.png"))
+        color_set = set(self.color_pages(job_id))
         targets = [p for p in all_pages if selected is None or p in set(selected)]
+        if selected is None and auto_ref and color_set and mode != "none":
+            # already-colored pages are references, not work
+            targets = [p for p in targets if p not in color_set]
+            if not targets:
+                raise ValueError("every page is already colored — nothing to colorize")
         if not targets:
             raise ValueError("no pages selected")
+
+        # Self-reference: detected color pages steer the palette of the rest.
+        refs: list[tuple[np.ndarray, np.ndarray]] = []
+        if auto_ref and color_set and mode != "none":
+            from .pipeline import colorstats
+
+            for cp in sorted(color_set):
+                f = pages_dir / f"page_{cp:05d}.png"
+                if f.exists():
+                    rgb = np.array(Image.open(f).convert("RGB"))
+                    refs.append((rgb, colorstats.lab_moments(rgb)))
 
         cancel = threading.Event()
         self.cancel_flags[job_id] = cancel
@@ -152,6 +239,12 @@ class JobManager:
         self.progress[job_id] = {"done": 0, "total": len(targets), "current": None}
 
         colorizer, theme_overlay = colorize_mod.build_colorizer(mode, device)
+        translator = None
+        if translate:
+            from .models.translator import MangaTranslator
+
+            translator = MangaTranslator(src_lang=translate_lang)
+        ref_rgb = np.array(Image.open(ref_image).convert("RGB")) if ref_image else None
         anchor_rgb = None
         errors = 0
         try:
@@ -162,13 +255,50 @@ class JobManager:
                 self.progress[job_id]["current"] = page
                 try:
                     src = np.array(Image.open(pages_dir / f"page_{page:05d}.png").convert("RGB"))
+                    auto_anchor = None
+                    auto_ipref = None
+                    if refs:
+                        from .pipeline import colorstats
+
+                        nearest = colorstats.nearest_reference(src, refs)
+                        if ref_rgb is None:
+                            auto_ipref = nearest  # ai mode: gentle panel-1 seed
+                        if anchor_rgb is None:
+                            auto_anchor = nearest  # fast/theme: chroma anchor
+                    extra = {"steps": steps, "ip_scale": ip_scale, "self_ref_scale": self_ref_scale}
+                    if ref_rgb is not None:
+                        extra["ref_rgb"] = ref_rgb  # explicit user ref: ip_scale strength
+                    elif auto_ipref is not None and ref_strength > 0:
+                        # NOT ref_rgb: a color insert must nudge, never override the
+                        # model's own semantics on every panel (that regressed quality)
+                        extra["auto_ref_rgb"] = auto_ipref
+                        extra["auto_ref_scale"] = min(1.0, ref_strength * 2)
                     req = colorize_mod.ColorizeRequest(
-                        page_rgb=src, mode=mode, ink_weight=ink_weight, anchor_rgb=anchor_rgb
+                        page_rgb=src, mode=mode, ink_weight=ink_weight,
+                        protect_text=protect_text,
+                        anchor_rgb=anchor_rgb if anchor_rgb is not None else (
+                            auto_anchor if ref_strength > 0 else None
+                        ),
+                        # auto anchor is a light bias — a strong pull drags every
+                        # page toward the cover's average and breaks correct colors
+                        anchor_strength=0.4 if anchor_rgb is not None else ref_strength,
+                        anchor_chroma_only=anchor_rgb is None and auto_anchor is not None,
+                        fill_voids=fill_voids and not mode.startswith("theme:") and mode != "none",
+                        extra=extra,
                     )
                     out = colorize_mod.run_page(colorizer, req)
                     if theme_overlay:
                         themed = colorize_mod.ThemeColorizer(theme_overlay)
                         out = themed.colorize(colorize_mod.ColorizeRequest(page_rgb=out, ink_weight=0.0))
+                    if translator is not None:
+                        from .models import bubbles
+                        from .pipeline import textlayer
+
+                        out = textlayer.translate_page(
+                            src, out, bubbles.detect_all,
+                            translator.ocr, translator.translate,
+                            include_sfx=translate_sfx, src_lang=translate_lang,
+                        )
                     if anchor_page is not None and page == anchor_page:
                         anchor_rgb = out.copy()
                     dest = out_dir / f"page_{page:05d}.png"
@@ -180,6 +310,8 @@ class JobManager:
                 self.progress[job_id]["done"] += 1
         finally:
             colorizer.close()
+            if translator is not None:
+                translator.close()
             self.cancel_flags.pop(job_id, None)
 
         status = "done" if errors == 0 else "done_with_errors"

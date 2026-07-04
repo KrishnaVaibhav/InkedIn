@@ -1,21 +1,55 @@
 [project]
 name = "inkedin-core"
 version = "0.1.0"
-description = "InkedIn - local manga/comic colorization engine"
+description = "InkedIn — local-first manga/comic colorization & translation. No cloud, no telemetry."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = ["manga", "comic", "colorization", "translation", "local-first"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Graphics",
+]
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.0",
     "pillow>=11.0",
     "pymupdf>=1.25",
-    "opencv-python-headless>=4.10",
+    "opencv-contrib-python-headless>=4.10",
     "fastapi>=0.115",
     "uvicorn>=0.34",
     "python-multipart>=0.0.20",
     "pydantic>=2.10",
+    "py7zr>=0.22",   # CB7; pure Python
+    "rarfile>=4.2",  # CBR; needs an external unar/bsdtar/unrar tool at runtime
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "httpx>=0.28"]
+build = ["pyinstaller>=6.10"]  # Windows/portable exe of the torch-free core
+# "ai" diffusion mode + translation (torch installed separately from the CUDA index, see README)
+ai = [
+    "diffusers>=0.31",
+    "transformers>=4.45",
+    "accelerate>=1.0",
+    "huggingface-hub>=0.26",
+    "onnxruntime>=1.20",
+    "sentencepiece>=0.2",  # M2M100 tokenizer
+    "fugashi>=1.3",        # manga-ocr Japanese tokenizer (decode)
+    "unidic-lite>=1.0.8",
+    # EasyOCR runtime deps (multi-language OCR). easyocr itself is installed
+    # with --no-deps (see README) because its opencv-python-headless pin would
+    # clobber our opencv-contrib build.
+    "scikit-image>=0.24",
+    "python-bidi>=0.6",
+    "pyyaml>=6.0",
+    "shapely>=2.0",
+    "pyclipper>=1.3",
+]
 
 [project.scripts]
 inkedin = "inkedin_core.cli:main"
@@ -29,3 +63,11 @@ packages = ["python/inkedin_core"]
 
 [tool.pytest.ini_options]
 testpaths = ["python/inkedin_core/tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+# default correctness set; style is deliberately not enforced beyond this
+select = ["E4", "E7", "E9", "F"]

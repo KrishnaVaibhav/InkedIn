@@ -1,0 +1,62 @@
+name: dependency health
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"  # every Monday 06:17 UTC
+  workflow_dispatch:
+
+jobs:
+  vulnerabilities:
+    name: pip-audit (known CVEs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - name: Install full stack
+        run: |
+          uv venv .venv --python 3.13
+          uv pip install -p .venv torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          uv pip install -p .venv -e ".[dev,ai]" pip-audit
+          uv pip install -p .venv --no-deps easyocr
+      - name: Audit installed environment
+        run: .venv/bin/python -m pip_audit --skip-editable
+
+  deprecations:
+    name: deprecation warnings (our own API usage)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - name: Install core
+        run: |
+          uv venv .venv --python 3.13
+          uv pip install -p .venv -e ".[dev]"
+      - name: Run suite with DeprecationWarnings as errors
+        # red here = a library we call is telling us an API we use is going away
+        run: .venv/bin/python -W error::DeprecationWarning -W error::FutureWarning -m pytest -q
+
+  outdated:
+    name: outdated packages report
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - name: Install core
+        run: |
+          uv venv .venv --python 3.13
+          uv pip install -p .venv -e ".[dev]"
+      - name: Report (informational — never fails the run)
+        run: |
+          echo "## Outdated packages" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          uv pip list -p .venv --outdated >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

@@ -84,7 +84,7 @@ class V2GanColorizer:
             out = out[:, : -pad[1]]
         out8 = (out * 255).astype(np.uint8)
         out8 = cv2.resize(out8, (src.shape[1], src.shape[0]), interpolation=cv2.INTER_LANCZOS4)
-        return recomposite.preserve_lines(src, out8, req.ink_weight)
+        return recomposite.recompose(src, out8, protect_text=req.protect_text)
 
     def close(self) -> None:
         del self.net

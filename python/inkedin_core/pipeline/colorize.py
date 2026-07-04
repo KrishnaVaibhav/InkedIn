@@ -32,8 +32,11 @@ class ColorizeRequest:
     page_rgb: np.ndarray  # HxWx3 uint8, source page
     mode: str = "fast"  # "fast" | "theme:<name>" | "fast+theme:<name>"
     ink_weight: float = 0.85
+    protect_text: bool = True  # keep speech bubbles neutral white
     anchor_rgb: np.ndarray | None = None  # palette anchor page (consistency)
     anchor_strength: float = 0.4
+    anchor_chroma_only: bool = False  # color-ref anchoring: don't drag lightness
+    fill_voids: bool = False  # inpaint chroma into enclosed gray "missing spots"
     extra: dict = field(default_factory=dict)
 
 
@@ -41,6 +44,16 @@ class Colorizer(Protocol):
     def colorize(self, req: ColorizeRequest) -> np.ndarray: ...
 
     def close(self) -> None: ...
+
+
+class PassthroughColorizer:
+    """mode 'none': keep the original art (translation-only jobs)."""
+
+    def colorize(self, req: ColorizeRequest) -> np.ndarray:
+        return req.page_rgb.copy()
+
+    def close(self) -> None:
+        pass
 
 
 class ThemeColorizer:
@@ -67,17 +80,25 @@ class ThemeColorizer:
 
 
 def run_page(colorizer: Colorizer, req: ColorizeRequest) -> np.ndarray:
-    """One page through: model -> optional theme grade -> palette anchor -> lines."""
+    """One page through: model -> void fill -> palette anchor -> ink guard.
+
+    The colorizer already recomposed once; after palette matching only the
+    cheap ink/bubble chroma guard runs — a second full recompose (guided
+    filter + L rebuild) visibly washes the model's colors out.
+    """
     out = colorizer.colorize(req)
+    if req.fill_voids:
+        out = recomposite.fill_chroma_voids(req.page_rgb, out, protect_text=req.protect_text)
     if req.anchor_rgb is not None:
-        out = recomposite.match_palette(out, req.anchor_rgb, req.anchor_strength)
-        out = recomposite.preserve_lines(req.page_rgb, out, req.ink_weight)
+        channels = (1, 2) if req.anchor_chroma_only else (0, 1, 2)
+        out = recomposite.match_palette(out, req.anchor_rgb, req.anchor_strength, channels=channels)
+        out = recomposite.neutralize_ink_and_bubbles(req.page_rgb, out, protect_text=req.protect_text)
     return out
 
 
 def build_colorizer(mode: str, device_pref: str = "auto") -> tuple[Colorizer, str | None]:
     """Returns (colorizer, theme_overlay). mode grammar:
-    "fast", "theme:sepia", "fast+theme:sunset"
+    "none", "fast", "ai", "ai:<prompt>", "theme:sepia", "fast+theme:sunset"
     """
     theme_overlay: str | None = None
     base = mode
@@ -86,6 +107,8 @@ def build_colorizer(mode: str, device_pref: str = "auto") -> tuple[Colorizer, st
     elif mode.startswith("theme:"):
         return ThemeColorizer(mode.removeprefix("theme:")), None
 
+    if base == "none":
+        return PassthroughColorizer(), theme_overlay
     if base == "fast":
         from ..models.gan import V2GanColorizer
 

@@ -1,6 +1,6 @@
 # InkedIn Research and Architecture
 
-Last updated: 2026-07-03
+Last updated: 2026-07-04
 
 ## Purpose
 
@@ -668,7 +668,7 @@ Fixed. Locked model plan for the three modes:
 | Mode | Locked choice | VRAM (fp16) | Notes |
 | --- | --- | --- | --- |
 | Fast automatic | manga-colorization-v2 architecture (ResNeXt U-Net generator + feature extractor) | ~2-3 GB, CPU capable | Weights license is unclear (research repo). Ship behind manifest; plan retrain/distill for redistribution. |
-| Reference-based | MangaNinja (CVPR 2025) | ~6 GB | Fits the 8 GB target GPU with fp16 + offloading. Milestone 4. |
+| Reference-based | ~~MangaNinja (CVPR 2025)~~ **Superseded 2026-07-04: Cobra (SIGGRAPH 2025)** — see Research Update below | ~9 GB | Cobra: Apache-2.0, 640×1024, multi-reference, color hints. MangaNinja demoted to optional precision tool (CC BY-NC, 512px, single ref). Milestone 4. |
 | Theme/prompt | SD 1.5 + ControlNet lineart (`lllyasviel/control_v11p_sd15_lineart`) | ~4-6 GB | SD 1.5 chosen over SDXL to fit 8 GB cards. Theme = prompt preset + optional LoRA. Milestone 4. |
 
 ### Gap 2: Panel detection method unspecified
@@ -717,6 +717,150 @@ The `%LOCALAPPDATA%` layout in the Windows Build Plan applies only to end-user i
 ### Gap 10: MVP shell order
 
 The Tauri + Rust + Python triple stack is the end-state. To get a working app sooner without violating the security rules, the MVP UI is the dev-mode local web UI this document already permits: FastAPI bound to `127.0.0.1` only, random per-session token required on every request, no external origins (strict CSP), disabled in packaged builds. The Rust/Tauri shell replaces it in Milestone 3+ without changing the Python core, because the pipeline is already IPC-shaped (job-scoped paths, schema-validated commands).
+
+## Research Update (2026-07-04): Import Coverage and Comic-Accurate Colorization
+
+Findings from a fresh survey of the mid-2026 landscape. Two questions: what should InkedIn ingest, and what produces the most comic-accurate (canon-faithful) color on local hardware.
+
+### Colorization model landscape (mid-2026)
+
+| Model | Venue | Base / arch | License | Cost measured | References | Code + weights | Verdict |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **Cobra** | SIGGRAPH 2025 | PixArt-XL-2-1024 DiT, text encoder removed; Causal Sparse Attention + KV cache over reference VAE latents | **Apache-2.0** | **9.3 GB, 0.31 s/image at 640×1024 with 24 refs**; memory/latency grow linearly to 200+ refs | Many full pages + per-region color hint points | [github.com/zhuang2002/Cobra](https://github.com/zhuang2002/Cobra), [HF JunhaoZhuang/Cobra](https://huggingface.co/JunhaoZhuang/Cobra), diffusers-loadable | **Adopt — new locked reference mode** |
+| ColorFlow | TencentARC 2024 | SD1.5 inpainting, 3 stages: CLIP patch retrieval (RAP) → in-context stitched-canvas colorization (ICP) at 512×800 → guided super-res (GSRP) | Academic non-commercial (ASL) | 36.4 GB, 1.03 s/image (A100) | Top-3 retrieved patches per query region | [github.com/TencentARC/ColorFlow](https://github.com/TencentARC/ColorFlow) | Don't ship (license + VRAM). **Copy the retrieval design** |
+| MangaNinja | CVPR 2025 | SD1.5 + lineart ControlNet + point net | CC BY-NC 4.0 | ~6 GB, 512×512 | Single ref + user point pairs | [github.com/ali-vilab/MangaNinjia](https://github.com/ali-vilab/MangaNinjia) | Optional precision tool only; demoted from locked plan |
+| MangaDiT | arXiv [2508.09709](https://arxiv.org/abs/2508.09709) | DiT, hierarchical attention w/ dynamic weighting | — | — | Ref-guided | "Code released soon" — not yet | Watchlist |
+| ColorizeDiffusion XL | WACV 2025 → XL @ CVPR 2026 | SDXL, 1024 px character colorization, disentangled embedding guidance | check repo | SDXL-class (~8 GB tight) | Single ref image | [github.com/tellurion-kanata/colorizeDiffusion](https://github.com/tellurion-kanata/colorizeDiffusion) | Watchlist; single-ref limits canon accuracy |
+| High-res disentangled ref colorization | arXiv [2603.05971](https://arxiv.org/abs/2603.05971) (2026-03) | SDXL dual-branch + Gram regularization + anime tagger net | — | — | Single ref | Code TBD | Watchlist (newest of the line) |
+| MagicColor (ICCV 2025), AnimeColor ([2507.20158](https://arxiv.org/abs/2507.20158)) | — | Multi-instance / DiT animation colorization | — | — | — | — | Adjacent (animation); ideas only |
+| Qwen-Image-Edit / FLUX.1 Kontext | 2025-26 instruction edit models | 20B MMDiT + Qwen2.5-VL-7B / 12B | Apache-2.0 / non-commercial dev | GGUF Q4 ≈ 12-13 GB; Q2 ≈ 7 GB but degraded; practical ≥ 16 GB | Prompt: "colorize this manga page" | ComfyUI/GGUF ecosystem | Optional high-VRAM backend later; no structural line guarantee — must stay behind our LAB recomposite |
+
+Key numbers that decided it: Cobra does what ColorFlow does at 1/4 the memory and 3x the speed, with a permissive license, purpose-built for comic pages, and it accepts both a reference library and per-point color hints — the two mechanisms comic-accuracy needs.
+
+### Locked plan: comic-accurate coloring (supersedes Gap 1 reference row)
+
+"Comic-accurate" means characters keep their canonical colors on every page. Mechanism stack, in pipeline order:
+
+1. **Per-series reference library.** User imports colored canon material once per series: official color volume pages, covers, anime stills. Stored under `data/refs/<series>/`. 8-24 refs is the working set on 8-12 GB VRAM (Cobra scales linearly if the user has more headroom).
+2. **Retrieval (ColorFlow's idea, our implementation).** Embed reference pages patch-wise with a CLIP image encoder (ViT-L, already shipped as part of the ai-mode stack); at job time embed each target page/panel and select top-k patches/pages by cosine similarity → feed as Cobra's reference set. Per-book index cached in the job DB.
+3. **Character palette DB.** Optional JSON per series: `character → {hair, skin, outfit} hex`. Auto-placed as Cobra hint points on matched regions; doubles as a post-pass LAB palette snap for the GAN/SD backends. UI: eyedropper + character name, saved with the series.
+4. **Existing invariants stay for every backend:** fixed seed per job, panel-to-panel palette anchor, chroma-only LAB recomposite with guided-filter edge snap (lines and text always survive the model).
+
+Backend ladder by hardware:
+
+| VRAM | Best mode |
+| --- | --- |
+| CPU only | `fast` GAN + palette snap |
+| 8 GB | `ai` (SD1.5 + ControlNet + IP-Adapter, panel-wise) or Cobra with small ref set / CPU offload |
+| 9-12 GB | **Cobra reference mode, 8-24 refs — the comic-accurate flagship** |
+| 16 GB+ | Optional: Qwen-Image-Edit (quantized) instruction backend behind recomposite |
+
+Near-term `ai`-mode upgrades (before Cobra lands): switch IP-Adapter to the Plus variant for stronger reference adherence, optional ControlNet-tile second pass for hi-res refinement, per-panel prompt overrides in the UI. Keep WD14 tagging (a 2026-03 SDXL paper independently validates tagger-driven conditioning).
+
+### Panels, text, bubbles (Milestone 4 lock)
+
+- **Adopt [ogkalu/comic-text-and-bubble-detector](https://huggingface.co/ogkalu/comic-text-and-bubble-detector)**: RT-DETR-v2 r50vd, 42.9M params, Apache-2.0, ONNX available (fits the onnxruntime dependency WD14 already uses). Classes: `bubble`, `text_bubble`, `text_free` — trained on ~11k manga/webtoon/manhua/western pages at 640 px. Use: bubble mask → keep interiors white; text masks → lossless text composite (closes Gap 3 exactly as planned).
+- Panel detection: keep rule-based OpenCV for MVP. Upgrade candidates: [Magi v2](https://huggingface.co/ragavsachdeva/magiv2) detects panels + characters + OCR + speaker attribution but is personal/research/non-commercial — optional plugin only, never bundled. CVPR 2025 published full segmentation annotations for Manga109 if we ever train our own panel-seg (Manga109 itself is research-only — check before use).
+- Avoid ultralytics-YOLOv8-based bubble models (e.g. kitsumed/yolov8m_seg-speech-bubble) in the shipped app: AGPL lineage.
+
+### Import coverage plan (priority order)
+
+Current: images, folders, PDF, CBZ. Add:
+
+1. **CB7** (7-Zip comics): `py7zr`, pure Python — no native extractor, lowest risk. Same limits as CBZ: max entries, compressed size, expanded size, expansion ratio; reject non-regular entries (py7zr's own symlink checks are best-effort, ours are authoritative). Read entries to memory, write via generated names only.
+2. **CBT** (tar comics): stdlib `tarfile` with Python 3.12+ `filter="data"` (blocks absolute paths, traversal, symlinks, devices) — and still route every entry through our validators.
+3. **CBR/RAR**: `rarfile` with backend preference **unar > bsdtar > unrar ≥ 6.12**. unrar < 6.12 has CVE-2022-30333 (path traversal via crafted Windows symlinks); bsdtar/libarchive lacks solid-archive and filter support so many CBRs fail on it. Mitigations: never let the tool extract to disk (stream entry bytes through `rarfile`'s read API), version-check the backend in `inkedin doctor`, run inside the short-lived decode worker. Windows ships no RAR tool by default — detect, degrade with a clear "install unar/unrar or convert to CBZ" message. This satisfies the original "sandboxed extractor + same expansion rules" requirement.
+4. **EPUB** (huge share of digital manga): it is a ZIP — reuse all CBZ container rules, then parse `META-INF/container.xml` → OPF spine → ordered image resources. Import images only; ignore scripts, fonts, styles. Fixed-layout manga EPUBs map 1:1 to pages.
+5. **Batch import**: folder-of-archives, recursion, multi-file drag-drop in UI; one job per book.
+6. Import niceties: double-page spread split (aspect > 1 → optional gutter split), RTL page-order toggle, cover detection/skip.
+
+Rejected: DjVu (native decoder surface, dying format — revisit on demand), MOBI/AZW3 (DRM entanglement — out of scope).
+
+### Upscalers
+
+- [MangaJaNai](https://github.com/the-database/MangaJaNai) (B&W manga, height-matched 1200-2048 px models) and IllustrationJaNai (color pages): best-in-class for manga sources but **CC BY-NC 4.0** — manifest-pinned user-initiated download only, never bundled. Use MangaJaNai as an optional *pre*-colorize cleanup for low-res/JPEG-artifacted sources; IllustrationJaNai as *post*-colorize upscale.
+- Real-ESRGAN anime (BSD-3) stays the redistributable default. Load `.pth`/safetensors ESRGAN-family weights via `spandrel` (MIT) instead of ad-hoc loaders.
+
+### Roadmap deltas
+
+- Milestone 4 reference mode = **Cobra** (integration: diffusers custom pipeline, bf16, panel- or page-wise at 640×1024, ref latents cached per job).
+- Milestone 4 adds: RT-DETR text/bubble masks, per-series reference library + CLIP retrieval index, character palette DB + hint-point UI (one UI serves both Cobra hints and future scribble modes).
+- Milestone 2.5 (cheap, next): CB7 + CBT + EPUB ingest (pure-Python), batch import, spread split, RTL ordering. **DONE 2026-07-04** — plus CBR via rarfile (stream-only, backend unar/bsdtar/unrar detected at runtime, Windows 11 ships bsdtar), RT-DETR bubble detector wired behind explicit `--ml-text` opt-in (local-files-only at inference time), and a full UI overhaul (multi-file drag-drop batch import, job list, theme swatches, ref upload, before/after compare slider).
+- Milestone 3 unchanged (device profiles).
+- **Translation (added 2026-07-04, shipped same day):** local OCR + MT + typesetting. manga-ocr-base (Apache-2.0) for Japanese, M2M100-418M (MIT) for translation (multilingual — source language is a parameter for when non-JP OCR lands), RT-DETR boxes as layout bounds. Original glyphs erased from source-page geometry (median-background fill in bubbles, Telea inpaint for SFX), English fitted (wrap + font-shrink) and centered inside the same box — overlap impossible by construction. Composable: colorize only / translate only (mode `none`) / both in one pass. CPU inference so it never competes with diffusion VRAM.
+
+## Self-Reference Colorization Plan (2026-07-04) — Tier 0 IMPLEMENTED same day
+
+Status: detection + skip + fast/theme palette anchoring + ai IP-Adapter auto-ref
+shipped (nearest ref by L-moment distance; CLIP retrieval remains Tier 1).
+Detection note: hue-spread metric must be circular std-dev in DEGREES with a
+low threshold (8°) — a "fraction of resultant vector" metric rejects real
+warm-dominant covers (measured 0.04 on a genuine multi-color page).
+Also shipped as part of the same quality pass: chroma-void inpainting for
+model-missed spots, ink-neutralization ramp lowered 90→65, chroma-only palette
+matching option, and border-component filtering in detector bubble masks
+(fixes rectangular white halos around round bubbles).
+
+Books often ship with a few official color pages (volume openers, covers,
+inserts). Detect them at ingest and use them as the color authority for the
+rest of the book — the book colorizes itself.
+
+### 1. Detection (cheap, deterministic, at ingest)
+
+For each ingested page compute chroma stats in LAB on a downscaled copy
+(the thumbnail pass already decodes every page):
+
+- `colorful_frac` = fraction of pixels with chroma magnitude
+  `sqrt((a-128)^2 + (b-128)^2) > 12`.
+- `hue_spread` = circular std-dev of hue over those colorful pixels.
+
+Classification:
+
+| Result | Rule |
+| --- | --- |
+| **color page** | `colorful_frac > 0.10` and `hue_spread` high (multi-hue art) |
+| **tinted scan** (yellowed paper, sepia print) | `colorful_frac` high but hue_spread ~0 (uniform cast) → treat as B&W |
+| **B&W** | otherwise. JPEG chroma noise stays far below the pixel threshold |
+
+Store `is_color` + `color_score` in the `pages` table. No ML, no downloads,
+~1 ms/page on the thumbnail.
+
+### 2. Behavior changes once detected
+
+- Color pages are **auto-deselected** from colorize targets (they are already
+  done); UI shows a 🎨 badge on them; export uses the original.
+- A banner appears: "N color pages detected — using them as color reference"
+  with an off toggle.
+- CLI: `--auto-ref on|off` (default on when color pages exist).
+
+### 3. Reference use, per mode (three tiers)
+
+| Tier | Mode | Mechanism | Effort |
+| --- | --- | --- | --- |
+| 0 — ship first | `fast`, `theme` | Palette anchor: `match_palette` (already exists) pulls every output page toward the LAB moments of the **nearest** color page instead of a user-picked anchor page | small |
+| 0 — ship first | `ai` | IP-Adapter auto-ref: instead of requiring `--ref`, feed the detected color page as `ip_adapter_image` (existing code path — only the source of the image changes) | small |
+| 1 | `ai` | Nearest-ref selection: embed all color pages once with the CLIP image encoder that IP-Adapter already loads; per B&W page (or per panel) pick the most similar color page as its ref — characters get matched to the color page they actually appear on | medium |
+| 2 — Milestone 4 | Cobra reference mode | The detected color pages ARE the reference library Cobra was chosen for (200+ refs supported, 9.3 GB @ 24 refs). Retrieval index from Tier 1 carries over unchanged | the Cobra integration itself |
+
+Ordering matters: Tier 0/1 are pure wiring around existing components
+(match_palette, IP-Adapter, CLIP encoder) and work today on 8 GB; Tier 2 is
+the quality ceiling.
+
+### 4. Implementation steps (Tier 0 + 1)
+
+1. `pipeline/colorstats.py`: `chroma_stats(rgb) -> (colorful_frac, hue_spread)`, `is_color_page(...)`. Unit tests: synthetic color page, sepia-tinted page, B&W page with JPEG noise, screentone page.
+2. Ingest/jobs: compute during thumbnail pass; add `is_color INTEGER, color_score REAL` to `pages` (additive schema migration).
+3. jobs.run: build `refs = [color pages]`; when `auto_ref` and refs exist — `fast`: per-page nearest ref (LAB-moment distance) as `anchor_rgb`; `ai`: nearest ref as `ref_rgb` in `ColorizeRequest.extra`; skip color pages from targets unless explicitly selected.
+4. Server/UI: `is_color` in pages payload → 🎨 badge + auto-deselect + banner toggle; `auto_ref` in RunJob.
+5. CLI: `--auto-ref`, doctor note.
+6. Tier 1: cache CLIP embeddings of refs in the job dir; cosine pick per page/panel.
+
+### 5. Edge cases
+
+- Only the cover is color and it is a stylized painting → palette anchor at low strength (0.3) so it nudges rather than repaints; IP-Adapter scale stays at the existing 0.65.
+- Color pages of a DIFFERENT character set (pin-up inserts) → Tier 1 nearest-ref naturally down-weights them; worst case the user toggles auto-ref off.
+- Spread-split halves inherit the parent page's `is_color`.
+- A book that is entirely color → nothing to colorize; UI says so instead of running.
 
 ## Final Recommendation
 

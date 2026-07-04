@@ -1,0 +1,160 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: ruff lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uvx ruff check python/
+
+  commit-style:
+    name: commit messages (Conventional Commits)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate every commit subject in this PR
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          pattern='^(feat|fix|docs|test|refactor|perf|chore|build|ci|style|security)(\([a-z0-9._/-]+\))?!?: .{1,72}$'
+          bad=0
+          while IFS= read -r subject; do
+            case "$subject" in
+              Merge\ *|Revert\ *|fixup!\ *|squash!\ *) continue ;;
+            esac
+            if ! printf '%s' "$subject" | grep -Eq "$pattern"; then
+              echo "::error::bad commit subject: $subject"
+              bad=1
+            fi
+          done < <(git log --no-merges --format=%s "$BASE".."$HEAD")
+          if [ "$bad" -ne 0 ]; then
+            echo ""
+            echo "Conventional Commits required: type(scope): summary (≤72 chars)"
+            echo "types: feat fix docs test refactor perf chore build ci style security"
+            exit 1
+          fi
+          echo "all commit subjects OK"
+
+  test:
+    name: tests · ${{ matrix.os }} · py${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - name: Install (core — the test suite is designed to run without torch)
+        shell: bash
+        run: |
+          uv venv .venv --python ${{ matrix.python }}
+          uv pip install -p .venv -e ".[dev]"
+      - name: Run tests
+        shell: bash
+        run: |
+          if [ -f .venv/bin/python ]; then PY=.venv/bin/python; else PY=.venv/Scripts/python.exe; fi
+          "$PY" -m pytest -q
+
+  ai-stack:
+    name: full AI stack import + tests (ubuntu, torch cpu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Install everything
+        run: |
+          uv venv .venv --python 3.13
+          uv pip install -p .venv torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          uv pip install -p .venv -e ".[dev,ai]"
+          uv pip install -p .venv --no-deps easyocr
+      - name: Import every module (catches breakage in lazily-imported AI code)
+        run: |
+          .venv/bin/python - <<'PY'
+          import importlib, pkgutil
+          import inkedin_core
+          failed = []
+          for m in pkgutil.walk_packages(inkedin_core.__path__, "inkedin_core."):
+              if ".tests" in m.name:
+                  continue
+              try:
+                  importlib.import_module(m.name)
+              except Exception as e:
+                  failed.append(f"{m.name}: {e}")
+          if failed:
+              raise SystemExit("import failures:\n" + "\n".join(failed))
+          print("all modules import cleanly")
+          PY
+      - name: Run tests with the full stack installed
+        run: .venv/bin/python -m pytest -q
+
+  build-exe:
+    name: build & smoke-test Windows exe
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Install core + PyInstaller (exe is the torch-free core)
+        run: |
+          uv venv .venv --python 3.13
+          uv pip install -p .venv -e ".[dev]" pyinstaller
+      - name: Build one-file executable
+        run: .venv/Scripts/pyinstaller.exe --noconfirm --onefile --name inkedin --collect-submodules uvicorn --workpath build/_work --specpath build --distpath dist build/pyinstaller_entry.py
+      - name: Smoke-test the exe (doctor + real colorize round-trip)
+        shell: bash
+        run: |
+          ./dist/inkedin.exe doctor
+          .venv/Scripts/python.exe - <<'PY'
+          from PIL import Image, ImageDraw
+          im = Image.new("RGB", (400, 600), (255, 255, 255))
+          d = ImageDraw.Draw(im)
+          d.rectangle([10, 10, 390, 590], outline=0, width=4)
+          im.save("ci_page.png")
+          PY
+          ./dist/inkedin.exe color ci_page.png -o ci_out --format folder --mode theme:sepia
+          test -f ci_out/page_00000.png && echo "exe colorize round-trip OK"
+      - name: Upload executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: inkedin-windows-exe
+          path: dist/inkedin.exe
+          retention-days: 14
+
+  dependency-review:
+    name: dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
