@@ -70,7 +70,7 @@ jobs:
       - name: Install (core — the test suite is designed to run without torch)
         shell: bash
         run: |
-          uv venv .venv --python ${{ matrix.python }}
+          uv venv --clear .venv --python ${{ matrix.python }}
           uv pip install -p .venv -e ".[dev]"
       - name: Run tests
         shell: bash
@@ -90,7 +90,7 @@ jobs:
           enable-cache: true
       - name: Install everything
         run: |
-          uv venv .venv --python 3.13
+          uv venv --clear .venv --python 3.13
           uv pip install -p .venv torch torchvision --index-url https://download.pytorch.org/whl/cpu
           uv pip install -p .venv -e ".[dev,ai]"
           uv pip install -p .venv --no-deps easyocr
@@ -126,7 +126,7 @@ jobs:
           enable-cache: true
       - name: Install core + PyInstaller (exe is the torch-free core)
         run: |
-          uv venv .venv --python 3.13
+          uv venv --clear .venv --python 3.13
           uv pip install -p .venv -e ".[dev]" pyinstaller
       - name: Build one-file executable
         run: .venv/Scripts/pyinstaller.exe --noconfirm --onefile --name inkedin --collect-submodules uvicorn --workpath build/_work --specpath build --distpath dist build/pyinstaller_entry.py

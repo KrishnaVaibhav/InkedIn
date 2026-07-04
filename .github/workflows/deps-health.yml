@@ -17,7 +17,7 @@ jobs:
           python-version: "3.13"
       - name: Install full stack
         run: |
-          uv venv .venv --python 3.13
+          uv venv --clear .venv --python 3.13
           uv pip install -p .venv torch torchvision --index-url https://download.pytorch.org/whl/cpu
           uv pip install -p .venv -e ".[dev,ai]" pip-audit
           uv pip install -p .venv --no-deps easyocr
@@ -35,7 +35,7 @@ jobs:
           python-version: "3.13"
       - name: Install core
         run: |
-          uv venv .venv --python 3.13
+          uv venv --clear .venv --python 3.13
           uv pip install -p .venv -e ".[dev]"
       - name: Run suite with DeprecationWarnings as errors
         # red here = a library we call is telling us an API we use is going away
@@ -52,7 +52,7 @@ jobs:
           python-version: "3.13"
       - name: Install core
         run: |
-          uv venv .venv --python 3.13
+          uv venv --clear .venv --python 3.13
           uv pip install -p .venv -e ".[dev]"
       - name: Report (informational — never fails the run)
         run: |
