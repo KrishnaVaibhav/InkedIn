@@ -162,10 +162,21 @@ def test_translate_page_replaces_bubble_text():
         calls["mt"] = t
         return "HELLO WORLD"
 
+    erased = page.copy()
+    layout = textlayer._inset_box(items[0]["box"])
+    padded_text = textlayer._pad_box(text_box, page.shape[1], page.shape[0])
+    erase_box = (
+        min(padded_text[0], layout[0]),
+        min(padded_text[1], layout[1]),
+        max(padded_text[2], layout[2]),
+        max(padded_text[3], layout[3]),
+    )
+    textlayer._erase_bubble_text(erased, page, erase_box)
+    # original lettering bar at y=142,x=250 was black; erasing fills it with bubble bg
+    assert erased[142, 250, 0] > 200
+
     out = textlayer.translate_page(page, page.copy(), detect, ocr, translate)
     assert calls["mt"] == "こんにちは世界"
-    # original lettering bar at y=141,x=200 was black; must be erased to bubble bg
-    assert out[142, 250, 0] > 200
     # new dark text pixels exist inside the text box
     x0, y0, x1, y1 = text_box
     region = out[y0:y1, x0:x1]
