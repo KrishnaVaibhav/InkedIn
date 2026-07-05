@@ -548,6 +548,13 @@ def test_server_download_export(manga_page):
     assert r.content[:2] == b"PK"  # a real ZIP came back
     assert "attachment" in r.headers.get("content-disposition", "")
 
+    r = c.get(f"/api/jobs/{job}/download/pdf", headers=H)
+    assert r.status_code == 200 and r.content[:4] == b"%PDF"
+
+    r = c.get(f"/api/jobs/{job}/download/folder", headers=H)
+    assert r.status_code == 200 and r.content[:2] == b"PK"  # pages delivered as .zip
+    assert r.headers["content-disposition"].endswith('.zip"') or ".zip" in r.headers["content-disposition"]
+
 
 def test_cli_parse_pages():
     from inkedin_core.cli import _parse_pages

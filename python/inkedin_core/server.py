@@ -302,15 +302,22 @@ def export(job_id: str, body: ExportJob):
 
 @app.get("/api/jobs/{job_id}/download/{fmt}", dependencies=[Depends(_auth)])
 def download(job_id: str, fmt: str):
-    """Export to the workspace exports dir and hand the file to the browser
-    (its own save dialog / Downloads folder) — the natural path for books
-    that were uploaded rather than opened from a local path."""
+    """Export to the workspace exports dir and hand the file to the browser —
+    the natural path for books that were uploaded rather than opened from a
+    local path. All formats: cbz, pdf, and folder (delivered as a .zip of the
+    page images, since a browser can't receive a directory)."""
+    import shutil
+
     _job_dir(job_id)
-    if fmt not in ("pdf", "cbz"):
-        raise HTTPException(400, "downloadable formats: cbz, pdf")
+    if fmt not in ("pdf", "cbz", "folder"):
+        raise HTTPException(400, "downloadable formats: cbz, pdf, folder")
     name = next((j["name"] for j in jm.list_jobs() if j["job"] == job_id), job_id)
     base = Path(name).stem or job_id
     try:
+        if fmt == "folder":
+            outdir = jm.export(job_id, "folder", exports_dir() / f"{base}_color_pages")
+            zip_path = shutil.make_archive(str(outdir), "zip", root_dir=outdir)
+            return FileResponse(zip_path, media_type="application/zip", filename=Path(zip_path).name)
         out = jm.export(job_id, fmt, exports_dir() / f"{base}_color.{fmt}")
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
@@ -409,6 +416,10 @@ button:disabled{opacity:.4;cursor:default}
 .spin::after{content:"";width:22px;height:22px;border:3px solid #fff3;border-top-color:var(--acc);border-radius:50%;
   animation:r 1s linear infinite}
 @keyframes r{to{transform:rotate(360deg)}}
+.btnspin{display:inline-block;width:12px;height:12px;border:2px solid #fff5;border-top-color:#fff;
+  border-radius:50%;animation:r .8s linear infinite;vertical-align:-2px;margin-right:7px}
+.upbar{height:5px;background:#2c2c38;border-radius:3px;overflow:hidden;margin-top:8px}
+.upbar>div{height:100%;background:var(--acc);width:0%;transition:width .2s}
 #refbox{display:flex;align-items:center;gap:10px;margin-top:6px}
 #refimg{width:44px;height:44px;object-fit:cover;border-radius:6px;border:1px solid var(--line);display:none}
 #modal{position:fixed;inset:0;background:#000d;display:none;flex-direction:column;align-items:center;
@@ -703,13 +714,38 @@ $('chone').onclick=()=>{$('chooser').style.display='none';if(PENDING)uploadBatch
 $('chsep').onclick=()=>{$('chooser').style.display='none';if(PENDING)uploadFiles(PENDING);PENDING=null};
 $('chx').onclick=()=>{$('chooser').style.display='none';PENDING=null};
 
+/* upload with real progress (fetch can't report upload %, XHR can). The
+   server ingests synchronously after the upload lands, so the bar fills to
+   100% and then shows an "importing" spinner phase. */
+function xhrUpload(url,fd,label){
+  return new Promise((resolve,reject)=>{
+    drop.innerHTML=`<b>${label}</b><div class="upbar"><div></div></div><div class="mini" id="upst">uploading… 0%</div>`;
+    const bar=drop.querySelector('.upbar>div'),st=drop.querySelector('#upst');
+    const x=new XMLHttpRequest();
+    x.open('POST',url);
+    x.setRequestHeader('x-inkedin-token',TOKEN);
+    x.upload.onprogress=e=>{if(e.lengthComputable){
+      const pc=Math.round(100*e.loaded/e.total);
+      bar.style.width=pc+'%';
+      st.textContent=pc<100?('uploading… '+pc+'%'):'processing pages…';
+      if(pc>=100)st.innerHTML='<span class="btnspin"></span>importing pages… (big books take a moment)'}};
+    x.onload=()=>{try{const j=JSON.parse(x.responseText);
+      x.status<400?resolve(j):reject(new Error(j.detail||x.status))}
+      catch(e){reject(new Error('bad response'))}};
+    x.onerror=()=>reject(new Error('network error'));
+    x.send(fd)});
+}
+
 async function uploadFiles(files){
   if(!files.length)return;
   const q=`?split_spreads=${$('split').checked}&rtl=${$('rtl').checked}`;
+  let i=0;
   for(const f of files){
-    drop.innerHTML=`<b>uploading ${f.name}…</b>`;
+    i++;
     const fd=new FormData();fd.append('file',f);
-    try{const r=await api('/api/jobs/upload'+q,{method:'POST',headers:UH,body:fd});
+    try{
+      const r=await xhrUpload('/api/jobs/upload'+q,fd,
+        files.length>1?`file ${i}/${files.length}: ${f.name}`:f.name);
       JOBNAMES[r.job]=r.name;$('imperr').textContent='';await refreshJobs();openJob(r.job,r.pages);
     }catch(err){$('imperr').textContent='✗ '+f.name+': '+err.message}}
   drop.innerHTML=DROP_HTML;
@@ -717,17 +753,17 @@ async function uploadFiles(files){
 
 async function uploadBatch(files,name){
   const q=`?split_spreads=${$('split').checked}&rtl=${$('rtl').checked}&name=${encodeURIComponent(name)}`;
-  drop.innerHTML=`<b>uploading ${files.length} page(s)…</b>`;
   const fd=new FormData();
   for(const f of files)fd.append('files',f);
-  try{const r=await api('/api/jobs/upload-batch'+q,{method:'POST',headers:UH,body:fd});
+  try{
+    const r=await xhrUpload('/api/jobs/upload-batch'+q,fd,`${files.length} page(s) → one book`);
     JOBNAMES[r.job]=r.name;$('imperr').textContent='';await refreshJobs();openJob(r.job,r.pages);
   }catch(err){$('imperr').textContent='✗ batch import: '+err.message}
   drop.innerHTML=DROP_HTML;
 }
 
 $('load').onclick=async()=>{try{
-  $('load').disabled=true;$('load').textContent='Importing…';
+  $('load').disabled=true;$('load').innerHTML='<span class="btnspin"></span>Importing… (large books take a while)';
   const r=await api('/api/jobs',{method:'POST',headers:H,body:JSON.stringify(
     {path:$('path').value,split_spreads:$('split').checked,rtl:$('rtl').checked})});
   $('imperr').textContent='';await refreshJobs();openJob(r.job,r.pages);
@@ -835,8 +871,9 @@ $('run').onclick=async()=>{if(!JOB||!SEL.size)return;
        self_ref_scale:parseFloat($('sc').value),steps:parseInt($('st').value),
        fill_voids:$('fillv').checked,protect_text:$('ptext').checked})});
     $('bar').style.display='block';$('bar').firstElementChild.style.width='0%';
-    log('starting…');POLL&&clearInterval(POLL);POLL=setInterval(refresh,1200);
-  }catch(e){log('run failed: '+e.message)}};
+    $('run').disabled=true;
+    log('⏳ starting…');POLL&&clearInterval(POLL);POLL=setInterval(refresh,1200);
+  }catch(e){log('run failed: '+e.message);$('run').disabled=false}};
 
 $('cancel').onclick=()=>JOB&&api(`/api/jobs/${JOB}/cancel`,{method:'POST',headers:H});
 
@@ -854,8 +891,11 @@ async function refresh(){if(!JOB)return;
     else st.textContent=''});
   if(r.progress){const pc=100*r.progress.done/r.progress.total;
     $('bar').style.display='block';$('bar').firstElementChild.style.width=pc+'%';
-    log(`progress: ${r.progress.done}/${r.progress.total}`+(err?` · ${err} failed`:''));
-    if(r.progress.done>=r.progress.total&&POLL){clearInterval(POLL);POLL=null;
+    if(r.progress.stage==='loading'&&r.progress.done===0)
+      log('⏳ loading / downloading models — the first run can take a few minutes…');
+    else
+      log(`progress: ${r.progress.done}/${r.progress.total} page(s)`+(err?` · ${err} failed`:''));
+    if(r.progress.done>=r.progress.total&&POLL){clearInterval(POLL);POLL=null;$('run').disabled=false;
       document.querySelectorAll('.pg.busy').forEach(d=>d.classList.remove('busy'));
       log(`finished: ${done} page(s) colorized`+(err?`, ${err} failed`:''));refreshJobs()}}
   if($('reader').classList.contains('on'))updateReader(false);
@@ -909,23 +949,49 @@ window.addEventListener('keydown',e=>{
 $('fmt').onchange=()=>{const base=$('dest').value.replace(/\.(cbz|pdf)$/i,'');
   $('dest').value=$('fmt').value==='folder'?base:base+'.'+$('fmt').value};
 $('dl').onclick=async()=>{if(!JOB)return;
-  const fmt=$('fmt').value==='pdf'?'pdf':'cbz';  // folder can't stream; default cbz
+  const fmt=$('fmt').value;  // cbz | pdf | folder (arrives as a .zip of pages)
   $('exphint').textContent='preparing '+fmt+' download…';
   try{
     const r=await fetch(`/api/jobs/${JOB}/download/${fmt}`,{headers:UH});
     if(!r.ok)throw new Error((await r.json()).detail||r.status);
-    const blob=await r.blob();
+    // stream with a live percentage when the size is known
+    let blob;
+    const total=+(r.headers.get('content-length')||0);
+    if(total&&r.body){
+      const reader=r.body.getReader();const chunks=[];let got=0;
+      for(;;){const {done,value}=await reader.read();if(done)break;
+        chunks.push(value);got+=value.length;
+        $('exphint').textContent=`downloading… ${Math.round(100*got/total)}%`}
+      blob=new Blob(chunks,{type:r.headers.get('content-type')||''});
+    }else blob=await r.blob();
     const m=(r.headers.get('content-disposition')||'').match(/filename="?([^";]+)/);
+    const name=m?m[1]:('book_color.'+(fmt==='folder'?'zip':fmt));
+    // Chrome/Edge: real "where do you want to save this?" dialog
+    if(window.showSaveFilePicker){
+      try{
+        const ext='.'+name.split('.').pop();
+        const h=await showSaveFilePicker({suggestedName:name,
+          types:[{description:'InkedIn export',accept:{[blob.type||'application/octet-stream']:[ext]}}]});
+        const w=await h.createWritable();await w.write(blob);await w.close();
+        $('exphint').textContent='✓ saved as '+h.name;return;
+      }catch(e){
+        if(e.name==='AbortError'){$('exphint').textContent='save cancelled';return}
+        // picker unavailable/denied: fall through to plain download
+      }
+    }
     const a=document.createElement('a');
-    a.href=URL.createObjectURL(blob);a.download=m?m[1]:`book_color.${fmt}`;
+    a.href=URL.createObjectURL(blob);a.download=name;
     a.click();URL.revokeObjectURL(a.href);
-    $('exphint').textContent='✓ downloaded '+a.download;
+    $('exphint').textContent='✓ downloaded '+name;
   }catch(e){$('exphint').textContent='download failed: '+e.message}};
 $('exp').onclick=async()=>{if(!JOB)return;
-  try{$('exphint').textContent='exporting…';
+  const old=$('exp').textContent;
+  try{$('exp').disabled=true;$('exp').innerHTML='<span class="btnspin"></span>Exporting…';
+    $('exphint').textContent='writing '+$('fmt').value+'…';
     const r=await api(`/api/jobs/${JOB}/export`,{method:'POST',headers:H,body:JSON.stringify(
       {fmt:$('fmt').value,dest:$('dest').value})});
     $('exphint').textContent='✓ exported → '+r.exported}
-  catch(e){$('exphint').textContent='export failed: '+e.message}};
+  catch(e){$('exphint').textContent='export failed: '+e.message}
+  finally{$('exp').disabled=false;$('exp').textContent=old}};
 </script></body></html>
 """

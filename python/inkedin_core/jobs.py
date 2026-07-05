@@ -236,7 +236,9 @@ class JobManager:
         cancel = threading.Event()
         self.cancel_flags[job_id] = cancel
         self._set_job(job_id, status="running", mode=mode, selected=json.dumps(targets))
-        self.progress[job_id] = {"done": 0, "total": len(targets), "current": None}
+        # stage lets the UI distinguish "downloading/loading models" (first run
+        # can pull gigabytes) from actual page processing
+        self.progress[job_id] = {"done": 0, "total": len(targets), "current": None, "stage": "loading"}
 
         colorizer, theme_overlay = colorize_mod.build_colorizer(mode, device)
         translator = None
@@ -244,6 +246,7 @@ class JobManager:
             from .models.translator import MangaTranslator
 
             translator = MangaTranslator(src_lang=translate_lang)
+        self.progress[job_id]["stage"] = "processing"
         ref_rgb = np.array(Image.open(ref_image).convert("RGB")) if ref_image else None
         anchor_rgb = None
         errors = 0
