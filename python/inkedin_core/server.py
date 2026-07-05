@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import secrets
-import threading
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
@@ -63,6 +62,7 @@ class RunJob(BaseModel):
     ref_strength: float = 0.15
     ip_scale: float = 0.65
     self_ref_scale: float = 0.4
+    page_consistency: float = 0.25
     steps: int = 24
     fill_voids: bool = True
     protect_text: bool = True
@@ -251,16 +251,15 @@ def image(job_id: str, kind: str, page: int):
 
 @app.post("/api/jobs/{job_id}/run", dependencies=[Depends(_auth)])
 def run(job_id: str, body: RunJob):
+    """Enqueue a run. One job processes at a time (single GPU); pressing Run
+    on another book lines it up behind the current one."""
     jdir = _job_dir(job_id)
-    if jm.progress.get(job_id, {}).get("current") is not None and job_id in jm.cancel_flags:
-        raise HTTPException(409, "job already running")
     if body.mode == "none" and not body.translate:
         raise HTTPException(400, "mode 'none' does nothing unless translate is enabled")
     ref = jdir / "ref.png"
-    t = threading.Thread(
-        target=jm.run,
-        args=(job_id,),
-        kwargs=dict(
+    try:
+        info = jm.enqueue_run(
+            job_id,
             selected=body.pages, mode=body.mode, device=body.device,
             ink_weight=body.ink_weight, anchor_page=body.anchor_page,
             ref_image=ref if (body.use_ref and ref.exists()) else None,
@@ -271,14 +270,14 @@ def run(job_id: str, body: RunJob):
             ref_strength=max(0.0, min(1.0, body.ref_strength)),
             ip_scale=max(0.0, min(1.0, body.ip_scale)),
             self_ref_scale=max(0.0, min(1.0, body.self_ref_scale)),
+            page_consistency=max(0.0, min(1.0, body.page_consistency)),
             steps=max(4, min(60, body.steps)),
             fill_voids=body.fill_voids,
             protect_text=body.protect_text,
-        ),
-        daemon=True,
-    )
-    t.start()
-    return {"started": True}
+        )
+    except ValueError as e:
+        raise HTTPException(409, str(e)) from e
+    return {"started": True, **info}
 
 
 @app.post("/api/jobs/{job_id}/cancel", dependencies=[Depends(_auth)])
@@ -544,6 +543,9 @@ kbd{background:#2c2c38;border-radius:4px;padding:0 5px;font-size:11px}
         <div><label>Panel consistency (ai) <span class="mini" id="scV">0.4</span></label>
           <input type="range" id="sc" min="0" max="1" step="0.05" value="0.4">
           <div class="hint">how strongly panels follow panel 1's colors</div></div>
+        <div><label>Cross-page consistency <span class="mini" id="pcV">0.25</span></label>
+          <input type="range" id="pc" min="0" max="1" step="0.05" value="0.25">
+          <div class="hint">later pages follow the first colorized page — keeps character hair/outfit colors stable</div></div>
         <div><label>AI steps <span class="mini" id="stV">24</span></label>
           <input type="range" id="st" min="8" max="50" step="1" value="24">
           <div class="hint">more = slower, finer detail</div></div>
@@ -648,7 +650,7 @@ function modeHint(){const v=$('mode').value;
   if(!v.startsWith('theme:'))document.querySelectorAll('.sw').forEach(x=>x.classList.remove('on'))}
 $('mode').onchange=modeHint;
 $('ink').oninput=()=>$('inkv').textContent=$('ink').value;
-[['refs','refsV'],['ips','ipsV'],['sc','scV'],['st','stV']].forEach(([s,v])=>
+[['refs','refsV'],['ips','ipsV'],['sc','scV'],['pc','pcV'],['st','stV']].forEach(([s,v])=>
   $(s).oninput=()=>$(v).textContent=$(s).value);
 
 /* ---- import ---- */
@@ -780,7 +782,8 @@ async function refreshJobs(){
   el.innerHTML='';
   r.jobs.forEach(j=>{
     const d=document.createElement('div');d.className='job'+(j.job===JOB?' on':'');
-    const icon=j.status==='running'?'⏳':j.status?.startsWith('done')?'✅':'📖';
+    const icon=j.status==='running'?'⏳':j.status==='queued'?'🕐':j.status==='error'?'⚠️'
+      :j.status?.startsWith('done')?'✅':'📖';
     d.innerHTML=`<span>${icon}</span><span class="nm">${JOBNAMES[j.job]||j.name}</span>
       <span class="np">${j.pages}p</span><button class="del" title="delete">✕</button>`;
     d.onclick=()=>openJob(j.job,j.pages);
@@ -803,6 +806,8 @@ async function openJob(id,n){
   $('refmsg').textContent=COLORSET.size+' already-colored page(s) detected — skipped from colorizing';
   $('empty').style.display='none';$('work').style.display='block';
   $('bar').style.display='none';log('');
+  $('run').disabled=false;  // each book has its own Run; the queue serializes them
+  POLL&&clearInterval(POLL);POLL=setInterval(refresh,1200);
   const nm=JOBNAMES[id]||'book';
   // default export location: the folder the book came from; uploaded books
   // (no source folder known to the server) fall back to the workspace exports dir
@@ -862,17 +867,19 @@ $('run').onclick=async()=>{if(!JOB||!SEL.size)return;
   if(mode==='ai'&&$('prompt').value.trim())mode='ai:'+$('prompt').value.trim();
   try{
     document.querySelectorAll('.pg').forEach(d=>{d.classList.remove('done','err');d.querySelector('.st').textContent=''});
-    await api(`/api/jobs/${JOB}/run`,{method:'POST',headers:H,body:JSON.stringify(
+    const rr=await api(`/api/jobs/${JOB}/run`,{method:'POST',headers:H,body:JSON.stringify(
       {pages:[...SEL],mode,device:$('dev').value,ink_weight:parseFloat($('ink').value)||0.85,
        use_ref:$('refimg').style.display!=='none',ml_text:$('mltext').checked,
        translate:$('trans').checked,translate_sfx:$('sfx').checked,
        translate_lang:$('tlang').value,auto_ref:$('autoref').checked,
        ref_strength:parseFloat($('refs').value),ip_scale:parseFloat($('ips').value),
-       self_ref_scale:parseFloat($('sc').value),steps:parseInt($('st').value),
+       self_ref_scale:parseFloat($('sc').value),page_consistency:parseFloat($('pc').value),
+       steps:parseInt($('st').value),
        fill_voids:$('fillv').checked,protect_text:$('ptext').checked})});
     $('bar').style.display='block';$('bar').firstElementChild.style.width='0%';
     $('run').disabled=true;
-    log('⏳ starting…');POLL&&clearInterval(POLL);POLL=setInterval(refresh,1200);
+    log(rr.position>0?`🕐 queued (position ${rr.position}) — another book is on the GPU right now`:'⏳ starting…');
+    POLL&&clearInterval(POLL);POLL=setInterval(refresh,1200);refreshJobs();
   }catch(e){log('run failed: '+e.message);$('run').disabled=false}};
 
 $('cancel').onclick=()=>JOB&&api(`/api/jobs/${JOB}/cancel`,{method:'POST',headers:H});
@@ -889,15 +896,26 @@ async function refresh(){if(!JOB)return;
       if(!im.dataset.out){im.src=want;im.dataset.out='1'}}
     else if(p.status==='error'){d.classList.add('err');st.textContent='✗';st.title=p.error||'';err++}
     else st.textContent=''});
-  if(r.progress){const pc=100*r.progress.done/r.progress.total;
-    $('bar').style.display='block';$('bar').firstElementChild.style.width=pc+'%';
-    if(r.progress.stage==='loading'&&r.progress.done===0)
-      log('⏳ loading / downloading models — the first run can take a few minutes…');
-    else
-      log(`progress: ${r.progress.done}/${r.progress.total} page(s)`+(err?` · ${err} failed`:''));
-    if(r.progress.done>=r.progress.total&&POLL){clearInterval(POLL);POLL=null;$('run').disabled=false;
-      document.querySelectorAll('.pg.busy').forEach(d=>d.classList.remove('busy'));
-      log(`finished: ${done} page(s) colorized`+(err?`, ${err} failed`:''));refreshJobs()}}
+  if(r.progress){const st=r.progress.stage;
+    $('bar').style.display='block';
+    if(st==='queued'){
+      $('bar').firstElementChild.style.width='0%';
+      log('🕐 queued — will start automatically when the current book finishes');
+    }else if(st==='error'){
+      log('✗ run failed: '+(r.progress.message||'see server log'));
+      if(POLL){clearInterval(POLL);POLL=null}
+      $('run').disabled=false;refreshJobs();
+    }else{
+      const pc=r.progress.total?100*r.progress.done/r.progress.total:0;
+      $('bar').firstElementChild.style.width=pc+'%';
+      if(st==='loading'&&r.progress.done===0)
+        log('⏳ loading / downloading models — the first run can take a few minutes…');
+      else
+        log(`progress: ${r.progress.done}/${r.progress.total} page(s)`+(err?` · ${err} failed`:''));
+      if(r.progress.total>0&&r.progress.done>=r.progress.total&&POLL){
+        clearInterval(POLL);POLL=null;$('run').disabled=false;
+        document.querySelectorAll('.pg.busy').forEach(d=>d.classList.remove('busy'));
+        log(`finished: ${done} page(s) colorized`+(err?`, ${err} failed`:''));refreshJobs()}}}
   if($('reader').classList.contains('on'))updateReader(false);
 }
 

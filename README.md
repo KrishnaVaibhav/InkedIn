@@ -39,7 +39,9 @@ uv pip install -p .venv --no-deps easyocr   # multi-language OCR (ko/zh/ru/es/�
 - Web UI **reader**: 📖 button or double-click a page — full-screen reading view with ←/→ navigation; shows colorized pages as they finish (live-swaps in while the job is still running), original for pages not done yet
 - Export: destination defaults to the folder the book was opened from (uploads default to `data/exports/`); **⬇ Download** button exports and saves through the browser
 - Web UI: drag-drop files **or a whole folder** (a folder of images imports as one book, pages in natural order); dropping/picking multiple loose images asks "one book or separate?"; folder picker button; job list, theme swatches, reference-image upload, shift-click range selection, live progress, before/after compare slider, export presets
-- **Tunable weights** (UI "⚙ Advanced" panel / CLI flags): reference influence `--ref-strength` (0 = model colors untouched), ai reference strength `--ip-scale`, panel consistency `--self-consistency`, diffusion `--steps`, plus toggles for missing-spot repair (`--no-fill-voids`) and bubble/text protection (`--no-protect-text`)
+- **Cross-page character consistency** (`--page-consistency`, default 0.25): later pages follow the first colorized page — chroma anchor in `fast`, rolling IP-Adapter chain in `ai` — so a character's hair/outfit colors stay stable through the whole book instead of drifting page to page
+- **Run queue**: one book processes at a time (single GPU); pressing Run on another book queues it (🕐 in the job list) and it starts automatically when the current one finishes — no VRAM pile-ups. Cancel dequeues a waiting job
+- **Tunable weights** (UI "⚙ Advanced" panel / CLI flags): reference influence `--ref-strength` (0 = model colors untouched), ai reference strength `--ip-scale`, panel consistency `--self-consistency`, cross-page consistency `--page-consistency`, diffusion `--steps`, plus toggles for missing-spot repair (`--no-fill-voids`) and bubble/text protection (`--no-protect-text`)
 - GPU: CUDA auto-detected (fp16), CPU fallback; `--device` to force
 
 ## Storage

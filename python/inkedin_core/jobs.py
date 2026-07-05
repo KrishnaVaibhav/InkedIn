@@ -65,6 +65,48 @@ class JobManager:
         self.lock = threading.Lock()
         self.cancel_flags: dict[str, threading.Event] = {}
         self.progress: dict[str, dict] = {}
+        # sequential run queue: one book on the GPU at a time; further Run
+        # clicks line up instead of competing for VRAM
+        self._queue: list[tuple[str, dict]] = []
+        self._queue_lock = threading.Lock()
+        self._worker: threading.Thread | None = None
+        self._running_job: str | None = None
+
+    # -- queued execution ----------------------------------------------------
+
+    def enqueue_run(self, job_id: str, **kwargs) -> dict:
+        """Queue a run; a single worker drains jobs FIFO. Returns queue info."""
+        with self._queue_lock:
+            if self._running_job == job_id or any(j == job_id for j, _ in self._queue):
+                raise ValueError("job already running or queued")
+            position = len(self._queue) + (1 if self._running_job else 0)
+            self._queue.append((job_id, kwargs))
+            self.progress[job_id] = {"done": 0, "total": 0, "current": None, "stage": "queued"}
+            if self._worker is None or not self._worker.is_alive():
+                self._worker = threading.Thread(target=self._drain_queue, daemon=True)
+                self._worker.start()
+        self._set_job(job_id, status="queued")
+        return {"queued": True, "position": position}
+
+    def _drain_queue(self) -> None:
+        while True:
+            with self._queue_lock:
+                if not self._queue:
+                    self._worker = None
+                    return
+                job_id, kwargs = self._queue.pop(0)
+                self._running_job = job_id
+            try:
+                self.run(job_id, **kwargs)
+            except Exception as e:  # keep draining; surface the error on the job
+                self._set_job(job_id, status="error", error=str(e)[:300])
+                self.progress[job_id] = {
+                    "done": 1, "total": 1, "current": None,
+                    "stage": "error", "message": str(e)[:200],
+                }
+            finally:
+                with self._queue_lock:
+                    self._running_job = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -151,6 +193,14 @@ class JobManager:
         return [r[0] for r in cur.fetchall()]
 
     def cancel(self, job_id: str) -> None:
+        with self._queue_lock:  # still waiting in line: just drop it
+            before = len(self._queue)
+            self._queue = [(j, k) for j, k in self._queue if j != job_id]
+            dequeued = len(self._queue) != before
+        if dequeued:
+            self.progress.pop(job_id, None)
+            self._set_job(job_id, status="ready")
+            return
         if job_id in self.cancel_flags:
             self.cancel_flags[job_id].set()
 
@@ -171,7 +221,7 @@ class JobManager:
                 shutil.rmtree(d, ignore_errors=True)
                 removed += 1
         with self.lock:
-            self.conn.execute("UPDATE jobs SET status='ready' WHERE status='running'")
+            self.conn.execute("UPDATE jobs SET status='ready' WHERE status IN ('running','queued')")
             self.conn.commit()
         return removed
 
@@ -197,6 +247,8 @@ class JobManager:
         steps: int = 24,  # ai: diffusion steps
         fill_voids: bool = True,  # inpaint enclosed gray "missing spots"
         protect_text: bool = True,  # keep bubbles/lettering neutral
+        page_consistency: float = 0.25,  # cross-page: later pages follow the
+        #   first colorized page so characters keep hair/outfit colors (0 = off)
     ) -> dict:
         """Colorize and/or translate selected pages (all if None). Blocking;
         call from a worker thread. mode 'none' + translate = translation only."""
@@ -249,6 +301,9 @@ class JobManager:
         self.progress[job_id]["stage"] = "processing"
         ref_rgb = np.array(Image.open(ref_image).convert("RGB")) if ref_image else None
         anchor_rgb = None
+        rolling_anchor = None  # first successfully colorized page of THIS run:
+        #   the stable color identity every later page is nudged toward
+        model_mode = not mode.startswith("theme:") and mode != "none"
         errors = 0
         try:
             for page in targets:
@@ -276,17 +331,27 @@ class JobManager:
                         # model's own semantics on every panel (that regressed quality)
                         extra["auto_ref_rgb"] = auto_ipref
                         extra["auto_ref_scale"] = min(1.0, ref_strength * 2)
+                    elif rolling_anchor is not None and page_consistency > 0:
+                        # cross-page character consistency: later pages seed from
+                        # the first colorized page instead of drifting freely
+                        extra["auto_ref_rgb"] = rolling_anchor
+                        extra["auto_ref_scale"] = min(1.0, page_consistency * 1.4)
+
+                    # anchor priority: user's anchor page > detected color page >
+                    # this run's first colorized page (cross-page consistency)
+                    eff_anchor = anchor_rgb
+                    eff_strength, chroma_only = 0.4, False
+                    if eff_anchor is None and auto_anchor is not None and ref_strength > 0:
+                        eff_anchor, eff_strength, chroma_only = auto_anchor, ref_strength, True
+                    elif eff_anchor is None and rolling_anchor is not None and page_consistency > 0:
+                        eff_anchor, eff_strength, chroma_only = rolling_anchor, page_consistency, True
                     req = colorize_mod.ColorizeRequest(
                         page_rgb=src, mode=mode, ink_weight=ink_weight,
                         protect_text=protect_text,
-                        anchor_rgb=anchor_rgb if anchor_rgb is not None else (
-                            auto_anchor if ref_strength > 0 else None
-                        ),
-                        # auto anchor is a light bias — a strong pull drags every
-                        # page toward the cover's average and breaks correct colors
-                        anchor_strength=0.4 if anchor_rgb is not None else ref_strength,
-                        anchor_chroma_only=anchor_rgb is None and auto_anchor is not None,
-                        fill_voids=fill_voids and not mode.startswith("theme:") and mode != "none",
+                        anchor_rgb=eff_anchor,
+                        anchor_strength=eff_strength,
+                        anchor_chroma_only=chroma_only,
+                        fill_voids=fill_voids and model_mode,
                         extra=extra,
                     )
                     out = colorize_mod.run_page(colorizer, req)
@@ -304,6 +369,8 @@ class JobManager:
                         )
                     if anchor_page is not None and page == anchor_page:
                         anchor_rgb = out.copy()
+                    if rolling_anchor is None and model_mode:
+                        rolling_anchor = out.copy()  # first page done = book's color identity
                     dest = out_dir / f"page_{page:05d}.png"
                     Image.fromarray(out).save(dest)
                     self._set_page(job_id, page, "done", str(dest))

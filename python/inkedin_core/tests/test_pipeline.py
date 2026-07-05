@@ -520,6 +520,42 @@ def test_ref_strength_zero_means_no_bias(tmp_path):
     assert np.array_equal(zero_bias, no_ref)  # strength 0 == feature fully out of the loop
 
 
+def test_run_queue_serializes_and_cancel_dequeues(manga_page, tmp_path):
+    import shutil
+    import time
+
+    import pytest
+
+    folder = tmp_path / "b"
+    folder.mkdir()
+    for i in range(3):
+        shutil.copy(manga_page, folder / f"p{i}.png")
+
+    jm = JobManager()
+    j1, j2, j3 = jm.create(folder), jm.create(folder), jm.create(folder)
+
+    def status(jid):
+        return jm.conn.execute("SELECT status FROM jobs WHERE id=?", (jid,)).fetchone()[0]
+
+    assert jm.enqueue_run(j1.id, mode="theme:sepia")["queued"]
+    info2 = jm.enqueue_run(j2.id, mode="theme:noir")
+    assert info2["position"] >= 1  # behind j1
+    jm.enqueue_run(j3.id, mode="theme:ocean")
+    with pytest.raises(ValueError):
+        jm.enqueue_run(j2.id, mode="theme:noir")  # already queued/running
+
+    jm.cancel(j3.id)  # still waiting in line: dequeued, never runs
+
+    for _ in range(400):
+        if status(j1.id).startswith("done") and status(j2.id).startswith("done"):
+            break
+        time.sleep(0.05)
+    assert status(j1.id).startswith("done")
+    assert status(j2.id).startswith("done")
+    assert status(j3.id) == "ready"  # cancelled out of the queue
+    assert not list((jm.job_dir(j3.id) / "colored").glob("*.png")) if (jm.job_dir(j3.id) / "colored").exists() else True
+
+
 def test_server_download_export(manga_page):
     import importlib
     import time

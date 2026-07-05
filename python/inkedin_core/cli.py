@@ -46,6 +46,8 @@ def main(argv: list[str] | None = None) -> int:
                       help="ai: IP-Adapter strength of an explicit --ref image, 0..1 (default 0.65)")
     tune.add_argument("--self-consistency", type=float, default=0.4,
                       help="ai: how strongly panels follow panel 1's colors, 0..1 (default 0.4)")
+    tune.add_argument("--page-consistency", type=float, default=0.25,
+                      help="how strongly later pages follow the first colorized page, 0..1 (default 0.25) — keeps a character's hair/outfit colors stable across the book; 0 disables")
     tune.add_argument("--steps", type=int, default=24, help="ai: diffusion steps (default 24; more = slower, finer)")
     tune.add_argument("--no-fill-voids", action="store_true", help="disable missing-spot chroma repair")
     tune.add_argument("--no-protect-text", action="store_true", help="disable bubble/lettering protection")
@@ -110,6 +112,7 @@ def _color(args) -> int:
         ref_strength=max(0.0, min(1.0, args.ref_strength)),
         ip_scale=max(0.0, min(1.0, args.ip_scale)),
         self_ref_scale=max(0.0, min(1.0, args.self_consistency)),
+        page_consistency=max(0.0, min(1.0, args.page_consistency)),
         steps=max(4, min(60, args.steps)),
         fill_voids=not args.no_fill_voids,
         protect_text=not args.no_protect_text,
